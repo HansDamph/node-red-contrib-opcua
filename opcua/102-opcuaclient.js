@@ -2678,12 +2678,15 @@ module.exports = function (RED) {
       // Without this, a redeploy starts a new connection while the old one is
       // still being torn down, causing the PLC to accumulate stale connections.
       if (node.client) {
+        if(!node.disconnecting) return done();
+        node.disconnecting = true;
         node.client.removeListener("connection_reestablished", reestablish);
         node.client.removeListener("backoff", backoff);
         node.client.removeListener("start_reconnection", reconnection);
-        node.client.disconnect(function () {
-          node.client = null;
+        await node.client.disconnect(function () {
           verbose_log("Client disconnected on node close");
+          node.disconnecting = false;
+          node.client = null;
           done();
         });
       } else {
