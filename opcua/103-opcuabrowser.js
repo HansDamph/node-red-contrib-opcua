@@ -171,8 +171,10 @@ module.exports = function (RED) {
             {
                 callback(err);
             }
-            if (client) {
-                client.disconnect();
+            finally {
+                if (client) {
+                    client.disconnect();
+                }
             }
         }
 
