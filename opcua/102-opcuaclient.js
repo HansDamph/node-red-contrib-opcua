@@ -175,6 +175,9 @@ module.exports = function (RED) {
 
     let monitoredItems = new Map();
     let pendingSubscribeMsgs = []; // subscribe msgs that arrived while the subscription was still starting up
+    // Original subscribe msgs, kept across (re)connects so subscriptions can
+    // be replayed automatically after a forced reconnection.
+    let autoResubscribe = new Map();
 
     // Liveness watchdog: node-opcua's internal keepalive/repair can get stuck
     // (e.g. its state machine wedged in "reconnecting"), in which case a hard
@@ -674,6 +677,17 @@ module.exports = function (RED) {
         node.session = session;
         set_node_status_to("session active");
         connectingInFlight = false;
+        // Re-subscribe everything that was subscribed before the (re)connect.
+        // subscribe_action_input routes through the normal subscribe path and
+        // is a no-op for topics that are already subscribed (e.g. when the
+        // flow's own "session active" path subscribed first), so this is safe
+        // to run alongside the flow's own re-subscribe logic.
+        if (autoResubscribe.size > 0) {
+          verbose_log("Auto re-subscribing " + autoResubscribe.size + " monitored item(s) after (re)connect");
+          for (const [, msg] of autoResubscribe) {
+            subscribe_action_input(msg);
+          }
+        }
         start_liveness_watchdog();
         for (let i in cmdQueue) {
           processInputMsg(cmdQueue[i]);
@@ -2193,6 +2207,7 @@ module.exports = function (RED) {
 
       // Simplified 
       if (msg.topic === "multiple") {
+        autoResubscribe.set("multiple", msg); // remember for auto re-subscribe after reconnect
         verbose_log("Create monitored itemGroup for " + JSON.stringify(msg.payload));
         let interval = opcuaBasics.calc_milliseconds_by_time_and_unit(node.time, node.timeUnit);
         if (msg?.interval) {
@@ -2292,6 +2307,7 @@ module.exports = function (RED) {
           );
           verbose_log("Storing monitoredItem: " + nodeStr + " ItemId: " + monitoredItem.toString());
           monitoredItems.set(itemKey, monitoredItem);
+          autoResubscribe.set(itemKey, msg); // remember for auto re-subscribe after reconnect
         } catch (err) {
           node_error("Check topic format for nodeId:" + msg.topic)
           node_error('subscription.monitorItem:' + err);
@@ -2485,6 +2501,7 @@ module.exports = function (RED) {
         verbose_log("Unsubscribing monitored item: " + msg.topic + " item:" + monitoredItem.toString());
         monitoredItem.terminate();
         monitoredItems.delete(itemKey);
+        autoResubscribe.delete(itemKey); // no auto re-subscribe for intentionally unsubscribed items
       }
       else {
         node_error("NodeId " + nodeStr + " is not subscribed!");
@@ -2495,7 +2512,10 @@ module.exports = function (RED) {
       verbose_log("delete subscription msg= " + stringify(msg));
       if (!subscription) {
         verbose_warn("Cannot delete, no subscription existing!");
-      } else if (subscription.isActive) {
+      } else {
+        autoResubscribe.clear(); // user deleted the subscription: no auto re-subscribe
+      }
+      if (subscription && subscription.isActive) {
         // otherwise check if its terminated start to renew the subscription
 
         node.session.deleteSubscriptions({
