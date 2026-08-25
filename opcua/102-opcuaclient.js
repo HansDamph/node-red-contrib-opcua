@@ -119,7 +119,13 @@ module.exports = function (RED) {
     }
 
     connectionOption.connectionStrategy = {
-      maxRetry: 10512000, // Limited to max 10 ~5min // 10512000, // 10 years should be enough. No infinite parameter for backoff.
+      // maxRetry 0: a single connect attempt, fail fast. The previous value
+      // (10512000 retries, "10 years") made connect() retry silently forever
+      // against a powered-off PLC - no error, no status change, nothing the
+      // user could see. With maxRetry 0 the (re)connect fails fast and the
+      // liveness watchdog below drives the retries, updating the node status
+      // on every attempt.
+      maxRetry: 0,
       initialDelay: 5000, // 5s
       maxDelay: 30 * 1000 // 30s
     };
@@ -169,6 +175,71 @@ module.exports = function (RED) {
 
     let monitoredItems = new Map();
     let pendingSubscribeMsgs = []; // subscribe msgs that arrived while the subscription was still starting up
+
+    // Liveness watchdog: node-opcua's internal keepalive/repair can get stuck
+    // (e.g. its state machine wedged in "reconnecting"), in which case a hard
+    // PLC power-off is never reported and the node stays green forever.
+    // The watchdog actively probes the server: every 15 s it issues a real
+    // Read of Server_ServerStatus_State. Two consecutive failures (or no
+    // session at all while we expect one) force a full teardown + reconnect.
+    // Note: session.lastResponseReceivedTime is NOT a usable signal here -
+    // node-opcua refreshes it even when the transaction times out.
+    let livenessTimer = null;
+    let connectingInFlight = false;
+    let livenessFails = 0;
+    let livenessBusy = false;
+
+    async function liveness_check() {
+      if (connectingInFlight) return; // a (re)connect attempt is in flight
+      if (currentStatus === "reconnect" || currentStatus === "disconnected") return;
+      if (livenessBusy) return;
+      livenessBusy = true;
+      try {
+        if (!node.session) {
+          // No session while we expect one (previous (re)connect failed) - retry now.
+          verbose_warn("No OPC UA session, retrying connection");
+          set_node_status2_to("reconnect", "no session, retrying connection");
+          reconnect(null);
+          livenessFails = 0;
+          return;
+        }
+        // Intentionally NOT deferring to client.isReconnecting or
+        // session.hasBeenClosed(): that internal state machine is exactly
+        // what can get stuck (socket destroyed but channel/session never
+        // actually closed, repair never starting), which is what this
+        // watchdog exists to override. A Read on a dead channel simply fails.
+        try {
+          await node.session.read({ nodeIdId: "ns=0;i=2256" }); // Server_ServerStatus_State
+          livenessFails = 0;
+        } catch (err) {
+          livenessFails++;
+          verbose_warn("Liveness check failed (" + livenessFails + "): " + err.message);
+          if (livenessFails >= 2) {
+            verbose_warn("Server not responding, forcing reconnection");
+            set_node_status2_to("reconnect", "server not responding, forcing reconnection");
+            livenessFails = 0;
+            reconnect(null);
+          }
+        }
+      } catch (err) {
+        verbose_warn("liveness watchdog error: " + stringify(err));
+      } finally {
+        livenessBusy = false;
+      }
+    }
+
+    function start_liveness_watchdog() {
+      if (livenessTimer) clearInterval(livenessTimer);
+      livenessFails = 0;
+      livenessTimer = setInterval(liveness_check, 15 * 1000);
+    }
+
+    function stop_liveness_watchdog() {
+      if (livenessTimer) {
+        clearInterval(livenessTimer);
+        livenessTimer = null;
+      }
+    }
 
 
     function node_error(err) {
@@ -541,8 +612,10 @@ module.exports = function (RED) {
         verbose_log(chalk.green("2) Connecting using endpoint: ") + chalk.cyan(opcuaEndpoint?.endpoint) +
           chalk.green(" securityMode: ") + chalk.cyan(connectionOption.securityMode) +
           chalk.green(" securityPolicy: ") + chalk.cyan(connectionOption.securityPolicy));
+        connectingInFlight = true;
         await node.client.connect(opcuaEndpoint?.endpoint);
       } catch (err) {
+          connectingInFlight = false;
           verbose_warn("Case A: Endpoint does not contain, 1==None 2==Sign 3==Sign&Encrypt, using securityMode: " + stringify(connectionOption.securityMode));
           verbose_warn("        using securityPolicy: " + stringify(connectionOption.securityPolicy));
           verbose_warn("Case B: UserName & password does not match to server (needed by Sign or SignAndEncrypt), check username: " + userIdentity.userName + " and password: " + userIdentity.password);
@@ -553,6 +626,9 @@ module.exports = function (RED) {
           verbose_warn("        Issuer CRL folder: " + node.client?.clientCertificateManager?.issuersCrlFolder);
           // verbose_error("Invalid endpoint parameters: ", err);
           node_error("Wrong endpoint parameters: " + JSON.stringify(opcuaEndpoint) + ", error: " + JSON.stringify(err));
+          // "invalid endpoint" is NOT in the watchdog's skip list, so the
+          // watchdog will keep retrying the (re)connection while the server
+          // is down.
           set_node_status_to("invalid endpoint");
           let msg = {};
           msg.error = {};
@@ -583,6 +659,7 @@ module.exports = function (RED) {
         // sessionName = "Node-red OPC UA Client node " + node.name;
         if (!node.client) {
           node_error("Client not yet created, cannot create session");
+          connectingInFlight = false;
           close_opcua_client("connection error: no client", 0);
           return;
         }
@@ -590,12 +667,14 @@ module.exports = function (RED) {
         if (!session) {
           node_error("Create session failed!");
           verbose_warn(`Create session failed!`)
-
+          connectingInFlight = false;
           close_opcua_client("connection error: no session", 0);
           return;
         }
         node.session = session;
         set_node_status_to("session active");
+        connectingInFlight = false;
+        start_liveness_watchdog();
         for (let i in cmdQueue) {
           processInputMsg(cmdQueue[i]);
         }
@@ -604,6 +683,7 @@ module.exports = function (RED) {
         node_error(node.name + " OPC UA connection error: " + err.message);
         verbose_log(err);
         node.session = null;
+        connectingInFlight = false;
         close_opcua_client("connection error", err);
       }
     }
@@ -667,6 +747,7 @@ module.exports = function (RED) {
     if (!node.client) {
       create_opcua_client(connect_opcua_client);
     }
+    start_liveness_watchdog();
 
     function processInputMsg(msg) {
       if (msg.action === "reconnect") {
@@ -1160,6 +1241,7 @@ module.exports = function (RED) {
         node.client.disconnect(function () {
           verbose_log("Client disconnected!");
           node.client = null;
+          stop_liveness_watchdog();
           set_node_status_to("disconnected");
         });
       }
@@ -2676,6 +2758,7 @@ module.exports = function (RED) {
     }
 
     node.on("close", async (done) => {
+      stop_liveness_watchdog();
       if (subscription?.isActive) {
         subscription.terminate();
         // subscription becomes null by its terminated event
