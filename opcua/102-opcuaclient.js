@@ -168,6 +168,7 @@ module.exports = function (RED) {
     let subscription; // only one subscription needed to hold multiple monitored Items
 
     let monitoredItems = new Map();
+    let pendingSubscribeMsgs = []; // subscribe msgs that arrived while the subscription was still starting up
 
 
     function node_error(err) {
@@ -630,8 +631,15 @@ module.exports = function (RED) {
       newSubscription.on("started", function () {
         verbose_log("Subscription subscribed ID: " + newSubscription.subscriptionId);
         set_node_status_to("subscribed");
+        // Terminate items tracked during the start-up race (created before "started" fired),
+        // otherwise they are forgotten by clear() but keep delivering.
+        monitoredItems.forEach(function (mi) {
+          try { if (mi && typeof mi.terminate === "function") mi.terminate(); } catch (e) { /* ignore */ }
+        });
         monitoredItems.clear();
-        callback(newSubscription, msg);
+        // Process the triggering msg plus all subscribe msgs that arrived while starting up
+        pendingSubscribeMsgs.forEach(function (m) { callback(newSubscription, m); });
+        pendingSubscribeMsgs = [];
       });
 
       newSubscription.on("keepalive", function () {
@@ -2035,10 +2043,14 @@ module.exports = function (RED) {
           timeMilliseconds = parseInt(msg.interval); // Use this instead of node.time and node.timeUnit
         }
         verbose_log("Using subscription with publish interval: " + timeMilliseconds);
+        pendingSubscribeMsgs = [msg];
         subscription = make_subscription(subscribe_monitoredItem, msg, opcuaBasics.getSubscriptionParameters(timeMilliseconds));
         let message = { "topic": "subscriptionId", "payload": subscription.subscriptionId };
         // node.send(message); // Make it possible to store
         node.send([message, null, null]);
+      } else if (!subscription.isActive) {
+        // Subscription is still starting up: remember the item so it is subscribed once "started" fires
+        pendingSubscribeMsgs.push(msg);
       } else if (subscription.subscriptionId != "terminated") {
         // otherwise check if its terminated start to renew the subscription
         set_node_status_to("active subscribing");
@@ -2055,6 +2067,7 @@ module.exports = function (RED) {
       if (!subscription) {
         // first build and start subscription and subscribe on its started event by callback
         let timeMilliseconds = opcuaBasics.calc_milliseconds_by_time_and_unit(node.time, node.timeUnit);
+        pendingSubscribeMsgs = []; // don't replay a stale subscribe queue with the monitor callback
         subscription = make_subscription(monitor_monitoredItem, msg, opcuaBasics.getSubscriptionParameters(timeMilliseconds));
       } else if (subscription.subscriptionId != "terminated") {
         // otherwise check if its terminated start to renew the subscription
@@ -2149,7 +2162,9 @@ module.exports = function (RED) {
           }
         }
       }
-      let monitoredItem = monitoredItems.get(msg.topic);
+      let itemKey = nodeStr;
+      try { itemKey = opcua.coerceNodeId(nodeStr).toString(); } catch (e) { /* keep raw topic as key */ }
+      let monitoredItem = monitoredItems.get(itemKey);
 
       if (!monitoredItem) {
         verbose_log("Msg " + stringify(msg));
@@ -2194,7 +2209,7 @@ module.exports = function (RED) {
             TimestampsToReturn.Both, // Other valid values: Source | Server | Neither | Both
           );
           verbose_log("Storing monitoredItem: " + nodeStr + " ItemId: " + monitoredItem.toString());
-          monitoredItems.set(nodeStr, monitoredItem);
+          monitoredItems.set(itemKey, monitoredItem);
         } catch (err) {
           node_error("Check topic format for nodeId:" + msg.topic)
           node_error('subscription.monitorItem:' + err);
@@ -2245,8 +2260,8 @@ module.exports = function (RED) {
 
         monitoredItem.on("terminated", function () {
           verbose_log("terminated monitoredItem on " + nodeStr);
-          if (monitoredItems.has(nodeStr)) {
-            monitoredItems.delete(nodeStr);
+          if (monitoredItems.has(itemKey)) {
+            monitoredItems.delete(itemKey);
           }
         });
       }
@@ -2263,7 +2278,9 @@ module.exports = function (RED) {
           nodeStr = nodeStr.substring(0, dTypeIndex);
         }
       }
-      let monitoredItem = monitoredItems.get(msg.topic);
+      let itemKey = nodeStr;
+      try { itemKey = opcua.coerceNodeId(nodeStr).toString(); } catch (e) { /* keep raw topic as key */ }
+      let monitoredItem = monitoredItems.get(itemKey);
       if (!monitoredItem) {
         verbose_log("Msg " + stringify(msg));
         let interval = 100; // Set as default if no payload
@@ -2329,7 +2346,7 @@ module.exports = function (RED) {
           },
           TimestampsToReturn.Both, // Other valid values: Source | Server | Neither | Both
         );
-        monitoredItems.set(nodeStr, monitoredItem);
+        monitoredItems.set(itemKey, group);
 
         group.on("err", () => {
           node.error("Monitored items error!");
@@ -2378,12 +2395,14 @@ module.exports = function (RED) {
           nodeStr = nodeStr.substring(0, dTypeIndex);
         }
       }
-      let monitoredItem = monitoredItems.get(msg.topic);
+      let itemKey = nodeStr;
+      try { itemKey = opcua.coerceNodeId(nodeStr).toString(); } catch (e) { /* keep raw topic as key */ }
+      let monitoredItem = monitoredItems.get(itemKey);
       if (monitoredItem) {
         verbose_log("Got ITEM: " + monitoredItem);
         verbose_log("Unsubscribing monitored item: " + msg.topic + " item:" + monitoredItem.toString());
         monitoredItem.terminate();
-        monitoredItems.delete(msg.topic);
+        monitoredItems.delete(itemKey);
       }
       else {
         node_error("NodeId " + nodeStr + " is not subscribed!");
@@ -2568,6 +2587,7 @@ module.exports = function (RED) {
       if (!subscription) {
         // first build and start subscription and subscribe on its started event by callback
         let timeMilliseconds = opcuaBasics.calc_milliseconds_by_time_and_unit(node.time, node.timeUnit);
+        pendingSubscribeMsgs = []; // don't replay a stale subscribe queue with the event callback
         subscription = make_subscription(subscribe_monitoredEvent, msg, opcuaBasics.getEventSubscriptionParameters(timeMilliseconds));
       } else if (subscription.subscriptionId != "terminated") {
         // otherwise check if its terminated start to renew the subscription
